@@ -398,14 +398,7 @@ private static long ParseHexInt64(string s)
                     _Disconnect();
                     _Disconnect = null;
                 }
-
-                if (hModule != IntPtr.Zero)
-                {
-                    FreeLibrary(hModule);
-                    hModule = IntPtr.Zero;
-                }
-
-                Log("Add-in OnDisconnection (" + disconnectMode.ToString() + ")");
+Log("Add-in OnDisconnection (" + disconnectMode.ToString() + ")");
             }
             catch
             {

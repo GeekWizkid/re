@@ -150,12 +150,12 @@ void ClickAndTypeText(HWND hwnd, char* text) {
 	ScreenToClient(hwnd, &pt);
 
 	// �������� ������� ����� ������� ����
-	SendMessage(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
-	SendMessage(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(pt.x, pt.y));
+	PostMessage(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(pt.x, pt.y));
+	PostMessage(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(pt.x, pt.y));
 
 	// ���� ������
 	for (size_t i = 0; i < strlen(text); ++i) {
-		SendMessage(hwnd, WM_CHAR, text[i], 0);
+		PostMessage(hwnd, WM_CHAR, text[i], 0);
 	}
 
 	// �������� ������� ������� Enter
@@ -193,10 +193,16 @@ BOOL CALLBACK EnumChildProc(HWND hwnd, LPARAM lParam)
 
 DWORD WINAPI StartServer(LPVOID) 
 {	
+	// IMPORTANT: this thread uses COM (IDispatch::Invoke). It must initialize COM.
+	HRESULT coHr = CoInitialize(NULL);
+
 	IDispatch *pDebugger = NULL;
 	HRESULT hr = pGIT->GetInterfaceFromGlobal(dwCookie, IID_IDispatch, (void **)&pDebugger);
-	if(FAILED(hr) || !pDebugger)
+	if(FAILED(hr) || !pDebugger) {
+		if(SUCCEEDED(coHr))
+			CoUninitialize();
 		return 0;
+	}
 
 	WSADATA wsaData;
 	struct sockaddr_in server, client;
@@ -230,10 +236,13 @@ DWORD WINAPI StartServer(LPVOID)
 	addrOld[0] = 0;
 	EnumWindows(EnumWindowsProc, 0);	
 	while(WaitForSingleObject(hStopEvent, 0) != WAIT_OBJECT_0) {
+		SOCKET listenSock = serverSocket;
+		if(listenSock == INVALID_SOCKET)
+			break;
 		fd_set readSet;
 		FD_ZERO(&readSet);
-		FD_SET(serverSocket, &readSet);
-		SOCKET maxSocket = serverSocket;
+		FD_SET(listenSock, &readSet);
+		SOCKET maxSocket = listenSock;
 
 		EnsureClientLockInitialized();
 		EnterCriticalSection(&gClientsLock);
@@ -254,8 +263,8 @@ DWORD WINAPI StartServer(LPVOID)
 		if(selectResult == 0)
 			continue;
 
-		if(FD_ISSET(serverSocket, &readSet)) {
-			SOCKET acceptedClient = accept(serverSocket, (struct sockaddr *)&client, &c);
+		if(FD_ISSET(listenSock, &readSet)) {
+			SOCKET acceptedClient = accept(listenSock, (struct sockaddr *)&client, &c);
 			if(acceptedClient != INVALID_SOCKET)
 				AddClientSocket(acceptedClient);
 		}
@@ -287,17 +296,18 @@ DWORD WINAPI StartServer(LPVOID)
 			if(strcmp(buffer, addrOld)) {
 				lstrcpynA(addrOld, buffer, sizeof(addrOld));
 				VARIANT result;
-				AutoWrap(DISPATCH_PROPERTYGET, &result, pDebugger, L"CurrentMode", 0);
-				if(result.lVal == 3) {
-				VARIANT variant;
-				VariantInit(&variant);
+				VariantInit(&result);
+				HRESULT hrMode = AutoWrap(DISPATCH_PROPERTYGET, &result, pDebugger, L"CurrentMode", 0);
+				if(SUCCEEDED(hrMode) && (result.vt == VT_I4 || result.vt == VT_INT) && result.lVal == 3) {
+					VARIANT variant;
+					VariantInit(&variant);
 
-				variant.vt = VT_BOOL;
-				variant.boolVal = VARIANT_TRUE;
-				AutoWrap(DISPATCH_METHOD, NULL, pDebugger, L"Break", 1, variant);
-				VariantClear(&variant);
-			}
-			VariantClear(&result);
+					variant.vt = VT_BOOL;
+					variant.boolVal = VARIANT_TRUE;
+					AutoWrap(DISPATCH_METHOD, NULL, pDebugger, L"Break", 1, variant);
+					VariantClear(&variant);
+				}
+				VariantClear(&result);
 
 			SearchData data;
 			data.className  = L"MsoCommandBar";
@@ -352,6 +362,8 @@ DWORD WINAPI StartServer(LPVOID)
 		gWsaStarted = false;
 	}
 	pDebugger->Release();
+	if(SUCCEEDED(coHr))
+		CoUninitialize();
 	return 0;
 }
 
@@ -409,15 +421,13 @@ extern "C" PIPE_API void _Connect(HWND hWnd, IDispatch* _pDTE, IDispatch* _pDebu
 }
 
 // This is an example of an exported function.
-extern "C" PIPE_API void _Disconnect()
+static volatile LONG g_disconnectWorkerStarted = 0;
+
+DWORD WINAPI DisconnectWorker(LPVOID)
 {
-	g_notifyHwnd = NULL;
-
-	if(hStopEvent)
-		SetEvent(hStopEvent);
-
+	// Wait for server thread to exit. Do NOT block the caller (UI thread) in _Disconnect().
 	if(hThread) {
-		WaitForSingleObject(hThread, 3000);
+		WaitForSingleObject(hThread, INFINITE);
 		CloseHandle(hThread);
 		hThread = NULL;
 	}
@@ -435,21 +445,34 @@ extern "C" PIPE_API void _Disconnect()
 		dwCookie = 0;
 	}
 
-	CloseAllClients();
+	// StartServer() performs sockets cleanup on exit. Here we only finalize shared state.
+	if(gClientsLockInitialized) {
+		DeleteCriticalSection(&gClientsLock);
+		gClientsLockInitialized = false;
+	}
 
+	InterlockedExchange((LONG*)&g_disconnectWorkerStarted, 0);
+	return 0;
+}
+
+extern "C" PIPE_API void _Disconnect()
+{
+	// Disable notifier
+	g_notifyHwnd = NULL;
+
+	// Signal server thread to stop
+	if(hStopEvent)
+		SetEvent(hStopEvent);
+
+	// Wake select() quickly
 	if(serverSocket != INVALID_SOCKET) {
 		closesocket(serverSocket);
 		serverSocket = INVALID_SOCKET;
 	}
 
-	if(gWsaStarted) {
-		WSACleanup();
-		gWsaStarted = false;
-	}
-
-	if(gClientsLockInitialized) {
-		DeleteCriticalSection(&gClientsLock);
-		gClientsLockInitialized = false;
+	// Async cleanup (do not block caller thread)
+	if(InterlockedCompareExchange((LONG*)&g_disconnectWorkerStarted, 1, 0) == 0) {
+		CreateThread(NULL, 0, DisconnectWorker, NULL, 0, NULL);
 	}
 }
 
@@ -469,7 +492,6 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 	case DLL_THREAD_DETACH:
 		break;
 	case DLL_PROCESS_DETACH:
-		_Disconnect();
 		break;
 	}
     return TRUE;

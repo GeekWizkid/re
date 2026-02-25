@@ -8,7 +8,8 @@ HRESULT AutoWrap(int autoType, VARIANT* pvResult, IDispatch* pDisp, LPOLESTR ptN
 
 	if (!pDisp) {
 		MessageBoxW(NULL, L"NULL IDispatch passed to AutoWrap()", L"Error", 0x10010);
-		_exit(0);
+		va_end(marker);
+		return E_POINTER;
 	}
 
 	// Variables used...
@@ -28,7 +29,7 @@ HRESULT AutoWrap(int autoType, VARIANT* pvResult, IDispatch* pDisp, LPOLESTR ptN
 	if (FAILED(hr)) {
 		wsprintfW(buf, L"IDispatch::GetIDsOfNames(\"%s\") failed w/err 0x%08lx", szName, hr);
 		MessageBoxW(NULL, buf, L"AutoWrap()", 0x10010);
-		_exit(0);
+		va_end(marker);
 		return hr;
 	}
 
@@ -54,7 +55,10 @@ HRESULT AutoWrap(int autoType, VARIANT* pvResult, IDispatch* pDisp, LPOLESTR ptN
 	if (FAILED(hr)) {
 		wsprintfW(buf, L"IDispatch::Invoke(\"%s\"=%08lx) failed w/err 0x%08lx", szName, dispID, hr);
 		MessageBoxW(NULL, buf, L"AutoWrap()", 0x10010);
-		_exit(0);
+		// IMPORTANT: do NOT terminate the host process (devenv.exe) on COM errors.
+		// Just return the HRESULT so the caller can handle it.
+		va_end(marker);
+		delete[] pArgs;
 		return hr;
 	}
 	// End variable-argument section...
