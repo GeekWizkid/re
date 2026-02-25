@@ -4,10 +4,16 @@
 #include "stdafx.h"
 #include "Pipe.h"
 #include "utils.h"
+#include <vector>
 
 
-HANDLE hThread;
-SOCKET serverSocket, clientSocket;
+HANDLE hThread = NULL;
+HANDLE hStopEvent = NULL;
+SOCKET serverSocket = INVALID_SOCKET;
+bool gWsaStarted = false;
+std::vector<SOCKET> gClients;
+CRITICAL_SECTION gClientsLock;
+bool gClientsLockInitialized = false;
 
 #ifdef _MANAGED
 #pragma managed(push, off)
@@ -27,6 +33,69 @@ IDispatch* pDTE;
 //IDispatch* pDebugger;
 IGlobalInterfaceTable *pGIT;
 DWORD dwCookie = 0;
+
+void EnsureClientLockInitialized()
+{
+	if(!gClientsLockInitialized) {
+		InitializeCriticalSection(&gClientsLock);
+		gClientsLockInitialized = true;
+	}
+}
+
+void AddClientSocket(SOCKET client)
+{
+	EnsureClientLockInitialized();
+	EnterCriticalSection(&gClientsLock);
+	gClients.push_back(client);
+	LeaveCriticalSection(&gClientsLock);
+}
+
+void RemoveClientSocket(SOCKET client)
+{
+	if(!gClientsLockInitialized)
+		return;
+
+	EnterCriticalSection(&gClientsLock);
+	for(std::vector<SOCKET>::iterator it = gClients.begin(); it != gClients.end(); ++it) {
+		if(*it == client) {
+			gClients.erase(it);
+			break;
+		}
+	}
+	LeaveCriticalSection(&gClientsLock);
+}
+
+void CloseAllClients()
+{
+	if(!gClientsLockInitialized)
+		return;
+
+	EnterCriticalSection(&gClientsLock);
+	for(std::vector<SOCKET>::iterator it = gClients.begin(); it != gClients.end(); ++it) {
+		if(*it != INVALID_SOCKET)
+			closesocket(*it);
+	}
+	gClients.clear();
+	LeaveCriticalSection(&gClientsLock);
+}
+
+void BroadcastToClients(const char* message)
+{
+	if(!message || !gClientsLockInitialized)
+		return;
+
+	EnterCriticalSection(&gClientsLock);
+	for(std::vector<SOCKET>::iterator it = gClients.begin(); it != gClients.end();) {
+		SOCKET client = *it;
+		if(send(client, message, (int)strlen(message), 0) == SOCKET_ERROR) {
+			closesocket(client);
+			it = gClients.erase(it);
+			continue;
+		}
+		++it;
+	}
+	LeaveCriticalSection(&gClientsLock);
+}
 
 BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
 	const int length = GetWindowTextLength(hwnd) + 1;
@@ -108,6 +177,8 @@ DWORD WINAPI StartServer(LPVOID)
 {	
 	IDispatch *pDebugger = NULL;
 	HRESULT hr = pGIT->GetInterfaceFromGlobal(dwCookie, IID_IDispatch, (void **)&pDebugger);
+	if(FAILED(hr) || !pDebugger)
+		return 0;
 
 	WSADATA wsaData;
 	struct sockaddr_in server, client;
@@ -115,28 +186,91 @@ DWORD WINAPI StartServer(LPVOID)
 	int recvSize;
 	char buffer[1024] = {};
 	char addrOld[1024] = {};
-	buffer[0] = '0';
-	buffer[1] = 'x'; 
+	char payload[1024] = {};
 
-	WSAStartup(MAKEWORD(2,2), &wsaData);
-	if(serverSocket) closesocket(serverSocket);
+	if(WSAStartup(MAKEWORD(2,2), &wsaData) == 0)
+		gWsaStarted = true;
+
+	if(serverSocket != INVALID_SOCKET)
+		closesocket(serverSocket);
 	serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+	if(serverSocket == INVALID_SOCKET)
+		goto Cleanup;
+
+	BOOL reuseAddr = TRUE;
+	setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuseAddr, sizeof(reuseAddr));
+
 	server.sin_family = AF_INET;
 	server.sin_addr.s_addr = INADDR_ANY;
 	server.sin_port = htons(8891);
-	bind(serverSocket, (struct sockaddr *)&server, sizeof(server));
-	listen(serverSocket, 1);
+	if(bind(serverSocket, (struct sockaddr *)&server, sizeof(server)) == SOCKET_ERROR)
+		goto Cleanup;
+	if(listen(serverSocket, SOMAXCONN) == SOCKET_ERROR)
+		goto Cleanup;
+
 	c = sizeof(struct sockaddr_in);
-	clientSocket = accept(serverSocket, (struct sockaddr *)&client, &c);
+	addrOld[0] = 0;
 	EnumWindows(EnumWindowsProc, 0);	
-	while(true) {
-		SOCKET recvSocket = accept(serverSocket, (struct sockaddr *)&client, &c);
-		memcpy(addrOld, buffer, lstrlenA(buffer));
-		recvSize = recv(recvSocket, &buffer[2], 18, 0);	
-		if(strcmp(buffer, addrOld)) {
-			VARIANT result;
-			AutoWrap(DISPATCH_PROPERTYGET, &result, pDebugger, L"CurrentMode", 0);
-			if(result.lVal == 3) {
+	while(WaitForSingleObject(hStopEvent, 0) != WAIT_OBJECT_0) {
+		fd_set readSet;
+		FD_ZERO(&readSet);
+		FD_SET(serverSocket, &readSet);
+		SOCKET maxSocket = serverSocket;
+
+		EnsureClientLockInitialized();
+		EnterCriticalSection(&gClientsLock);
+		for(std::vector<SOCKET>::iterator it = gClients.begin(); it != gClients.end(); ++it) {
+			FD_SET(*it, &readSet);
+			if(*it > maxSocket)
+				maxSocket = *it;
+		}
+		LeaveCriticalSection(&gClientsLock);
+
+		timeval timeout;
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 200000;
+
+		int selectResult = select((int)(maxSocket + 1), &readSet, NULL, NULL, &timeout);
+		if(selectResult == SOCKET_ERROR)
+			break;
+		if(selectResult == 0)
+			continue;
+
+		if(FD_ISSET(serverSocket, &readSet)) {
+			SOCKET acceptedClient = accept(serverSocket, (struct sockaddr *)&client, &c);
+			if(acceptedClient != INVALID_SOCKET)
+				AddClientSocket(acceptedClient);
+		}
+
+		EnterCriticalSection(&gClientsLock);
+		for(std::vector<SOCKET>::iterator it = gClients.begin(); it != gClients.end();) {
+			SOCKET recvSocket = *it;
+			if(!FD_ISSET(recvSocket, &readSet)) {
+				++it;
+				continue;
+			}
+
+			recvSize = recv(recvSocket, payload, sizeof(payload) - 1, 0);
+			if(recvSize <= 0) {
+				closesocket(recvSocket);
+				it = gClients.erase(it);
+				continue;
+			}
+
+			payload[recvSize] = 0;
+			while(recvSize > 0 && (payload[recvSize - 1] == '\r' || payload[recvSize - 1] == '\n')) {
+				payload[recvSize - 1] = 0;
+				recvSize--;
+			}
+
+			lstrcpyA(buffer, "0x");
+			lstrcpynA(buffer + 2, payload, sizeof(buffer) - 2);
+
+			if(strcmp(buffer, addrOld)) {
+				lstrcpynA(addrOld, buffer, sizeof(addrOld));
+				VARIANT result;
+				AutoWrap(DISPATCH_PROPERTYGET, &result, pDebugger, L"CurrentMode", 0);
+				if(result.lVal == 3) {
 				VARIANT variant;
 				VariantInit(&variant);
 
@@ -180,10 +314,23 @@ DWORD WINAPI StartServer(LPVOID)
 			if (!hEdit) goto EndFindWindow;
 
 
-			ClickAndTypeText(hEdit, buffer);
-		}	
-		EndFindWindow:
-		closesocket(recvSocket);		
+				ClickAndTypeText(hEdit, buffer);
+			}
+			EndFindWindow:
+			++it;
+		}
+		LeaveCriticalSection(&gClientsLock);
+	}
+
+	Cleanup:
+	CloseAllClients();
+	if(serverSocket != INVALID_SOCKET) {
+		closesocket(serverSocket);
+		serverSocket = INVALID_SOCKET;
+	}
+	if(gWsaStarted) {
+		WSACleanup();
+		gWsaStarted = false;
 	}
 	pDebugger->Release();
 	return 0;
@@ -217,20 +364,7 @@ void MaximizeWindow(HWND hwnd) {
 // This is an example of an exported function.
 extern "C" PIPE_API int _WriteAddr(char* message)
 {
-	DWORD dwWritten = 0;
-	if (clientSocket) {
-		if (send(clientSocket, message, (int)strlen(message), 0) == SOCKET_ERROR) {
-			DWORD dwError = GetLastError();
-			if (dwError == 10054) {
-				clientSocket = NULL;
-				CloseHandle(hThread);
-				hThread = CreateThread(NULL, 0,	StartServer, NULL, 0, NULL);
-			}
-		}
-		else {
-			//MaximizeWindow(hCodeBrowser);
-		}
-	}	
+	BroadcastToClients(message);
 	return 0;
 }
 
@@ -240,7 +374,17 @@ extern "C" PIPE_API void _Connect(HWND hWnd, IDispatch* _pDTE, IDispatch* _pDebu
 	hMain = hWnd;
 	pDTE = _pDTE;
 	//pDebugger = _pDebugger;
+	EnsureClientLockInitialized();
+
+	if(hStopEvent)
+		CloseHandle(hStopEvent);
+	hStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+	if(!hStopEvent)
+		return;
+
 	HRESULT hr = CoCreateInstance(CLSID_StdGlobalInterfaceTable, NULL, CLSCTX_INPROC_SERVER, IID_IGlobalInterfaceTable, (void **)&pGIT);
+	if(FAILED(hr) || !pGIT)
+		return;
 	pGIT->RegisterInterfaceInGlobal(_pDebugger, IID_IDispatch, &dwCookie);
 	hThread = CreateThread(NULL, 0,	StartServer, NULL, 0, NULL);
 }
@@ -248,18 +392,44 @@ extern "C" PIPE_API void _Connect(HWND hWnd, IDispatch* _pDTE, IDispatch* _pDebu
 // This is an example of an exported function.
 extern "C" PIPE_API void _Disconnect()
 {
-	if(pGIT)
-		pGIT->Release();
-	if(hThread)	{
-		TerminateThread(hThread, 0);
+	if(hStopEvent)
+		SetEvent(hStopEvent);
+
+	if(hThread) {
+		WaitForSingleObject(hThread, 3000);
 		CloseHandle(hThread);
 		hThread = NULL;
 	}
-	if(serverSocket) {
+
+	if(hStopEvent) {
+		CloseHandle(hStopEvent);
+		hStopEvent = NULL;
+	}
+
+	if(pGIT) {
+		if(dwCookie)
+			pGIT->RevokeInterfaceFromGlobal(dwCookie);
+		pGIT->Release();
+		pGIT = NULL;
+		dwCookie = 0;
+	}
+
+	CloseAllClients();
+
+	if(serverSocket != INVALID_SOCKET) {
 		closesocket(serverSocket);
-		serverSocket = NULL;
-		clientSocket = NULL;
-	}	
+		serverSocket = INVALID_SOCKET;
+	}
+
+	if(gWsaStarted) {
+		WSACleanup();
+		gWsaStarted = false;
+	}
+
+	if(gClientsLockInitialized) {
+		DeleteCriticalSection(&gClientsLock);
+		gClientsLockInitialized = false;
+	}
 }
 
 BOOL APIENTRY DllMain( HMODULE hModule,
@@ -287,5 +457,3 @@ BOOL APIENTRY DllMain( HMODULE hModule,
 #ifdef _MANAGED
 #pragma managed(pop)
 #endif
-
-
