@@ -33,6 +33,24 @@ IDispatch* pDTE;
 //IDispatch* pDebugger;
 IGlobalInterfaceTable *pGIT;
 DWORD dwCookie = 0;
+// Окно-уведомитель (создаётся в C# аддине). Нужно, чтобы после прыжка по адресу
+// попытаться перейти в исходник (если он доступен по PDB/Source).
+static HWND g_notifyHwnd = NULL;
+static const UINT WM_IDA_JUMP_DONE = WM_APP + 0x123;
+
+static void NotifyJumpDone()
+{
+    if (g_notifyHwnd != NULL)
+        PostMessage(g_notifyHwnd, WM_IDA_JUMP_DONE, 0, 0);
+}
+
+// Экспорт: задаём HWND окна-уведомителя (можно передать NULL, чтобы отключить)
+extern "C" PIPE_API void _SetNotifyWindow(HWND hwnd)
+{
+    g_notifyHwnd = hwnd;
+}
+
+
 
 void EnsureClientLockInitialized()
 {
@@ -315,6 +333,7 @@ DWORD WINAPI StartServer(LPVOID)
 
 
 				ClickAndTypeText(hEdit, buffer);
+				NotifyJumpDone();
 			}
 			EndFindWindow:
 			++it;
@@ -392,6 +411,8 @@ extern "C" PIPE_API void _Connect(HWND hWnd, IDispatch* _pDTE, IDispatch* _pDebu
 // This is an example of an exported function.
 extern "C" PIPE_API void _Disconnect()
 {
+	g_notifyHwnd = NULL;
+
 	if(hStopEvent)
 		SetEvent(hStopEvent);
 
